@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.streamlit/secrets.toml
+Vendor_*
+!Vendor_1.xlsx
+!Vendor_2.pdf
+!Vendor_3.docx
+!Vendor_4.txt
+!Vendor_5.png
+Aerchain-Product-Assignment*.pdf
+Email.txt
