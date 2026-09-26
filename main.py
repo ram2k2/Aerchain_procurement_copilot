@@ -6,6 +6,9 @@ import json
 import mimetypes
 import os
 import re
+import urllib.error
+import urllib.parse
+import urllib.request
 import zipfile
 from difflib import SequenceMatcher
 from email import policy
@@ -165,6 +168,64 @@ def empty_rfx() -> dict:
     return {"scope": "", "items": [], "questionnaire": [], "commercial_terms": {}}
 
 
+def _currency_code(value: Any) -> str:
+    text = _text(value).upper()
+    aliases = {"₹": "INR", "RS": "INR", "RUPEE": "INR", "RUPEES": "INR",
+               "US DOLLAR": "USD", "US DOLLARS": "USD"}
+    if text in aliases:
+        return aliases[text]
+    if "₹" in text or re.search(r"\bRUPEES?\b", text):
+        return "INR"
+    if re.search(r"\bUS DOLLARS?\b", text):
+        return "USD"
+    ignored = {"ALL", "THE", "FOR", "AND", "ARE", "PER", "ANY", "NOT", "BUY", "NET", "GST", "TAX"}
+    return next((code for code in re.findall(r"\b[A-Z]{3}\b", text) if code not in ignored), "")
+
+
+def infer_rfx_currency(rfx: dict | None) -> str:
+    """Read the buyer's comparison currency from the RFx commercial terms."""
+    terms = (rfx or {}).get("commercial_terms") or {}
+    for key, value in terms.items():
+        normalized_key = _key(_text(key))
+        if normalized_key in {"currency", "pricecurrency", "comparisoncurrency", "basecurrency", "prices"}:
+            code = _currency_code(value)
+            if code:
+                return code
+    return ""
+
+
+def _fetch_fx_rates(base_currency: str, source_currencies: list[str]) -> tuple[dict[str, float], dict[str, str], str | None]:
+    """Fetch all required latest source-to-base rates with one no-key FX request."""
+    base = _currency_code(base_currency)
+    sources = sorted({code for value in source_currencies if (code := _currency_code(value)) and code != base})
+    if not base or not sources:
+        return {}, {}, None
+    query = urllib.parse.urlencode({"base": base, "quotes": ",".join(sources)})
+    url = f"https://api.frankfurter.dev/v2/rates?{query}"
+    try:
+        request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "Aerchain-Procurement-Copilot/1.0"})
+        with urllib.request.urlopen(request, timeout=8) as response:
+            rows = json.load(response)
+        if not isinstance(rows, list):
+            raise ValueError("FX provider returned an unexpected response format.")
+        # API rate is units of source quote currency per one target-base unit;
+        # invert it to convert vendor prices into the comparison currency.
+        rates, dates = {}, {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            quote = _currency_code(row.get("quote"))
+            rate = _number(row.get("rate"))
+            if quote in sources and rate and rate > 0:
+                rates[quote] = 1 / rate
+                dates[quote] = _text(row.get("date"))
+        missing = sorted(set(sources) - set(rates))
+        note = f"No rate returned for {', '.join(missing)}." if missing else None
+        return rates, dates, note
+    except (OSError, urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+        return {}, {}, f"Could not retrieve exchange rates: {exc}"
+
+
 def _source(source) -> tuple[str, bytes]:
     name = getattr(source, "name", None) or Path(source).name
     if hasattr(source, "getvalue"):
@@ -226,11 +287,30 @@ def _term_key(value: Any) -> str:
 def _spreadsheet(name: str, data: bytes) -> dict | None:
     if Path(name).suffix.lower() not in {".xlsx", ".xls", ".csv"}:
         return None
-    sheets = {"CSV": pd.read_csv(io.BytesIO(data))} if name.lower().endswith(".csv") else pd.read_excel(io.BytesIO(data), sheet_name=None)
+    sheets = {"CSV": pd.read_csv(io.BytesIO(data), header=None)} if name.lower().endswith(".csv") else pd.read_excel(io.BytesIO(data), sheet_name=None, header=None)
     quotes, extra, commercial_terms = [], [], {}
+    quote_table_found = False
     for sheet_name, frame in sheets.items():
         if frame.empty:
             continue
+        header_row = None
+        header_values = None
+        for row_index in range(min(len(frame), 15)):
+            values = frame.iloc[row_index].fillna("").astype(str).tolist()
+            headers = _map_headers(values)
+            keys = {re.sub(r"[^a-z0-9]+", " ", value.lower()).strip() for value in values}
+            has_terms = bool(keys & {"term", "commercial term", "term name"}) and bool(
+                keys & {"vendor response", "supplier response", "response", "answer", "value"})
+            if headers["item"] or has_terms:
+                header_row, header_values = row_index, values
+                quote_table_found = quote_table_found or bool(headers["item"])
+                break
+        if header_row is None:
+            extra.append(f"Could not recognize quote or terms table headers in sheet '{sheet_name}'.")
+            continue
+        frame = frame.iloc[header_row + 1:].copy()
+        frame.columns = header_values
+        frame = frame.reset_index(drop=True)
         mapping = _map_headers(frame.columns)
         if not mapping["item"]:
             header_keys = {re.sub(r"[^a-z0-9]+", " ", str(column).lower()).strip(): column for column in frame.columns}
@@ -243,7 +323,7 @@ def _spreadsheet(name: str, data: bytes) -> dict | None:
                     if term and response:
                         commercial_terms[term] = response
             else:
-                extra.append(frame.to_string(index=False))
+                extra.append(f"Could not map response columns in sheet '{sheet_name}'.")
             continue
         for row_idx, row in frame.iterrows():
             item_name = _text(row[mapping["item"]])
@@ -256,11 +336,15 @@ def _spreadsheet(name: str, data: bytes) -> dict | None:
             quote["currency"] = quote["currency"].upper()
             quote["price_basis"] = quote["price_basis"] or f"per {quote['unit']}"
             quote.update({"confidence": "high", "evidence": "; ".join(f"{field}: {quote[field]}" for field in ("item", "quantity", "unit", "unit_price", "currency") if quote.get(field)),
-                          "source_location": f"{sheet_name}, row {int(row_idx) + 2}", "notes": ""})
+                          "source_location": f"{sheet_name}, row {int(row_idx) + header_row + 2}", "notes": ""})
             quotes.append(quote)
-    return {"file_name": name, "vendor": Path(name).stem, "source_status": "readable",
+    notes = list(extra)
+    if not quote_table_found:
+        notes.insert(0, "Quote table format not recognized; line-item coverage cannot be determined from this workbook.")
+    return {"file_name": name, "vendor": Path(name).stem,
+            "source_status": "readable" if quote_table_found else "unrecognized_layout",
             "items": quotes, "questionnaire": {}, "commercial_terms": commercial_terms,
-            "source_notes": "\n".join(extra)}
+            "source_notes": "\n".join(notes)}
 
 
 def _prepare_unstructured(name: str, data: bytes) -> dict:
@@ -421,7 +505,9 @@ def _normalise(raw: dict, fallback_name: str, rfx: dict | None = None) -> dict:
         questionnaire = {str(question): _text(qdata.get(str(question), qdata.get(f"question_{index + 1}", "")))
                          for index, question in enumerate(questions)}
     status = _text(raw.get("source_status")).lower().replace(" ", "_").replace("-", "_")
-    if "unreadable" in status:
+    if status == "unrecognized_layout" or "unrecognized_layout" in status:
+        status = "unrecognized_layout"
+    elif "unreadable" in status:
         status = "unreadable"
     elif "partial" in status:
         status = "partially_readable"
@@ -462,6 +548,32 @@ def _unit(value: str) -> str:
     return {"pc": "pcs", "piece": "pcs", "pieces": "pcs", "sheet": "sheets", "kilogram": "kg", "kilograms": "kg"}.get(key, key)
 
 
+def _price_basis_conversion(basis: str, quoted_unit: str) -> tuple[float, bool, str]:
+    """Return the count of quoted units per stated price, or explain why unsafe."""
+    text = _text(basis).lower().strip()
+    unit = _unit(quoted_unit)
+    if not text:
+        return 1, False, "price basis is not stated"
+    batch = re.search(r"\bper\s+(\d+(?:\.\d+)?)\s*([a-z]+)?\b", text)
+    if batch:
+        count = float(batch.group(1))
+        basis_unit = _unit(batch.group(2) or quoted_unit)
+        if count > 0 and unit and basis_unit == unit:
+            return count, True, ""
+        return 1, False, f"price basis '{basis}' cannot be converted to vendor unit '{quoted_unit}'"
+    single = re.search(r"\bper\s+([a-z]+)\b", text)
+    if single:
+        basis_word = _unit(single.group(1))
+        if basis_word in {"unit", "item", "each"}:
+            return 1, bool(unit), "" if unit else "vendor unit is missing"
+        if unit and basis_word == unit:
+            return 1, True, ""
+        return 1, False, f"price basis '{basis}' cannot be converted to vendor unit '{quoted_unit}'"
+    if text in {"each", "unit price", "per unit price"}:
+        return 1, bool(unit), "" if unit else "vendor unit is missing"
+    return 1, False, f"unrecognized price basis '{basis}'"
+
+
 def _item_match_score(requested: dict, quote: dict) -> float:
     item_score = SequenceMatcher(None, _key(requested["item"]), _key(quote.get("item", ""))).ratio()
     quoted_spec = _text(quote.get("specification"))
@@ -471,10 +583,14 @@ def _item_match_score(requested: dict, quote: dict) -> float:
     return item_score
 
 
-def compare_vendor_with_rfx(vendor: dict, rfx: dict | None = None, fx_rates: dict | None = None) -> dict:
+def compare_vendor_with_rfx(vendor: dict, rfx: dict | None = None, fx_rates: dict | None = None,
+                           base_currency: str | None = None, fx_rate_dates: dict | None = None,
+                           fx_rate_source: str | None = None, fx_rate_error: str | None = None) -> dict:
     if not isinstance(rfx, dict):
         raise ValueError("Create an RFx from the buyer's instructions before comparing vendor responses.")
+    base_currency = _currency_code(base_currency) or infer_rfx_currency(rfx)
     fx_rates = {k.upper(): float(v) for k, v in (fx_rates or {}).items()}
+    fx_rate_dates = {k.upper(): _text(v) for k, v in (fx_rate_dates or {}).items()}
     quotes = vendor.get("items", [])
     matched: set[int] = set()
     lines, missing, qty_issues, unit_issues, currency_issues, spec_issues, other = [], [], [], [], [], [], []
@@ -506,7 +622,9 @@ def compare_vendor_with_rfx(vendor: dict, rfx: dict | None = None, fx_rates: dic
         safe_match = score >= 0.82 and not tied and not target_tied and confidence != "low"
         if not safe_match:
             source_status = vendor.get("source_status", "readable")
-            if source_status == "unreadable":
+            if source_status == "unrecognized_layout":
+                status = "Needs review - quote table format not recognized"
+            elif source_status == "unreadable":
                 status = "Unable to read source"
             elif source_status == "partially_readable":
                 status = "No match found; source partially unreadable"
@@ -531,28 +649,42 @@ def compare_vendor_with_rfx(vendor: dict, rfx: dict | None = None, fx_rates: dic
         if quote.get("unit") and not unit_ok:
             unit_issues.append({"item": req["item"], "requested": req["unit"], "quoted": quote["unit"]})
         currency = _text(quote.get("currency")).upper() or "Unknown"
-        fx_rate = 1.0 if currency == "INR" else fx_rates.get(currency)
+        fx_rate = 1.0 if base_currency and currency == base_currency else fx_rates.get(currency)
         if currency == "Unknown":
-            currency_issues.append({"item": req["item"], "requested": "Currency stated in RFx/vendor response", "quoted": "Not stated", "issue": "Currency is missing; no conversion or comparable total calculated"})
-        elif currency != "INR" and fx_rate is None:
-            currency_issues.append({"item": req["item"], "requested": "Comparable currency", "quoted": currency,
-                                   "issue": "No FX conversion applied; cross-currency totals are excluded"})
+            currency_issues.append({"item": req["item"], "requested": f"Currency stated for {base_currency or 'comparison'}", "quoted": "Not stated", "issue": "Currency is missing; no conversion or comparable total calculated"})
+        elif not base_currency:
+            currency_issues.append({"item": req["item"], "requested": "Comparison currency in RFx", "quoted": currency,
+                                   "issue": "RFx comparison currency is not specified; price is not normalized"})
+        elif currency != base_currency and fx_rate is None:
+            currency_issues.append({"item": req["item"], "requested": base_currency, "quoted": currency,
+                                   "issue": f"No exchange rate available from {currency} to {base_currency}; price is not normalized"})
         basis = _text(quote.get("price_basis"))
-        basis_match = re.search(r"per\s*100\s*([a-z]+)?", basis, re.I)
-        basis_count = 1
-        basis_ok = True
-        if basis_match:
-            basis_unit = _unit(basis_match.group(1) or quote.get("unit", ""))
-            basis_ok = bool(basis_unit) and basis_unit == quoted_unit
-            basis_count = 100 if basis_ok else 1
+        basis_count, basis_ok, basis_reason = _price_basis_conversion(basis, quote.get("unit", ""))
         unit_price = quote.get("unit_price")
-        normalized_price = unit_price / basis_count * fx_rate if unit_price is not None and fx_rate is not None and basis_ok else None
+        normalized_price = unit_price / basis_count * fx_rate if unit_price is not None and fx_rate is not None and basis_ok and unit_ok else None
+        price_reasons = []
+        if not _text(quote.get("unit")):
+            price_reasons.append("vendor unit is missing")
+        elif not unit_ok:
+            price_reasons.append(f"vendor unit '{quote.get('unit')}' differs from RFx unit '{req.get('unit', '')}'")
+        if not basis_ok:
+            price_reasons.append(basis_reason)
+        if unit_price is None:
+            price_reasons.append("unit price is missing or unreadable")
+        if currency == "Unknown":
+            price_reasons.append("vendor did not state a currency")
+        elif not base_currency:
+            price_reasons.append("RFx comparison currency is not specified")
+        elif currency != base_currency and fx_rate is None:
+            price_reasons.append(f"no exchange rate is available from {currency} to {base_currency}")
+        if normalized_price is None and not price_reasons:
+            price_reasons.append("price details could not be safely normalized")
         enough_qty = requested_qty is None or (quoted_qty is not None and quoted_qty >= requested_qty)
         total = normalized_price * requested_qty if requested_qty is not None and normalized_price is not None and unit_ok and enough_qty else None
         if unit_price is not None and not unit_ok:
             other.append({"item": req["item"], "issue": "Unit price is not comparable until units are reconciled"})
         if unit_price is not None and not basis_ok:
-            other.append({"item": req["item"], "issue": f"Price basis '{basis}' does not match the quoted unit"})
+            other.append({"item": req["item"], "issue": basis_reason, "evidence": _text(quote.get("evidence"))})
         if requested_qty is not None and quoted_qty is not None and quoted_qty < requested_qty:
             other.append({"item": req["item"], "issue": "Quoted quantity is below the RFx requirement; full-line total omitted"})
         if unit_price is None:
@@ -580,7 +712,9 @@ def compare_vendor_with_rfx(vendor: dict, rfx: dict | None = None, fx_rates: dic
         lines.append({**req, "quantity": requested_qty, "quote_status": "Quoted", "vendor_item": quote.get("item", ""),
                       "quoted_quantity": quoted_qty, "quoted_unit": quote.get("unit", ""),
                       "unit_price": unit_price, "currency": currency, "price_basis": basis,
+                      "price_not_comparable_reason": "; ".join(price_reasons) if normalized_price is None else "",
                       "normalized_price": normalized_price, "fx_rate": fx_rate,
+                      "fx_rate_date": fx_rate_dates.get(currency, ""), "comparison_currency": base_currency,
                       "comparable_total": total, "gst": quote.get("gst", ""),
                       "delivery_days": quote.get("delivery_days", ""), "confidence": confidence,
                       "evidence": _text(quote.get("evidence")), "source_location": _text(quote.get("source_location")),
@@ -613,16 +747,24 @@ def compare_vendor_with_rfx(vendor: dict, rfx: dict | None = None, fx_rates: dic
             continue
         if _key(_text(expected)) not in _key(actual) and _key(actual) not in _key(_text(expected)):
             term_issues.append({"term": key, "expected": expected, "actual": actual, "issue": "Review deviation from RFx"})
-    return {"items": lines, "missing_items": missing, "quantity_mismatches": qty_issues,
+    fx_rates_used = {currency: {"rate": rate, "date": fx_rate_dates.get(currency, "")}
+                     for currency, rate in fx_rates.items() if currency != base_currency}
+    return {"items": lines, "comparison_currency": base_currency, "fx_rates_used": fx_rates_used,
+            "fx_rate_dates": fx_rate_dates, "fx_rate_source": fx_rate_source,
+            "fx_rate_error": fx_rate_error, "missing_items": missing, "quantity_mismatches": qty_issues,
             "unit_mismatches": unit_issues, "specification_mismatches": spec_issues,
             "currency_mismatches": currency_issues, "questionnaire_issues": questionnaire_issues,
             "term_issues": term_issues, "other_issues": other, "vendor_notes": vendor.get("source_notes", "")}
 
 
-def process_vendor_responses(sources, rfx: dict | None = None, fx_rates: dict | None = None) -> tuple[list[dict], int]:
+def process_vendor_responses(sources, rfx: dict | None = None, fx_rates: dict | None = None,
+                             comparison_currency: str | None = None) -> tuple[list[dict], int]:
     """Parse spreadsheets locally, extract all other uploads in one request, then compare locally."""
     if not isinstance(rfx, dict) or not rfx.get("items"):
         raise ValueError("Generate an RFx with at least one line item before processing vendor responses.")
+    base_currency = _currency_code(comparison_currency) or infer_rfx_currency(rfx)
+    if not base_currency:
+        raise ValueError("Set a comparison currency in the RFx commercial terms or enter its three-letter code.")
     structured, unstructured = [], []
     for source in sources:
         name, data = _source(source)
@@ -658,11 +800,23 @@ def process_vendor_responses(sources, rfx: dict | None = None, fx_rates: dict | 
         except Exception as exc:
             raise ValueError(f"Vendor extraction failed after {extraction_calls} Gemini request(s) in this attempt. "
                              f"No comparison was created. {exc}") from exc
+    source_currencies = [quote.get("currency", "") for vendor in structured for quote in vendor.get("items", [])]
+    foreign_currencies = {code for value in source_currencies if (code := _currency_code(value)) and code != base_currency}
+    fx_rate_dates: dict[str, str] = {}
+    fx_rate_error = None
+    fx_rate_source = None
+    if fx_rates is None:
+        fx_rates, fx_rate_dates, fx_rate_error = _fetch_fx_rates(base_currency, sorted(foreign_currencies))
+        fx_rate_source = "Frankfurter" if foreign_currencies else None
+    else:
+        fx_rate_source = "Provided rates" if foreign_currencies else None
     results = []
     for vendor in structured:
         results.append({"vendor": vendor["vendor"], "file_name": vendor["file_name"], "data": vendor,
                         "terms": {"questionnaire": vendor["questionnaire"], "commercial_terms": vendor["commercial_terms"]},
-                        "comparison": compare_vendor_with_rfx(vendor, rfx, fx_rates), "status": "Processed"})
+                        "comparison": compare_vendor_with_rfx(vendor, rfx, fx_rates, base_currency,
+                                                                fx_rate_dates, fx_rate_source, fx_rate_error),
+                        "status": "Processed"})
     return results, extraction_calls
 
 
@@ -711,17 +865,18 @@ def analyst_answer(question: str, results: list[dict], rfx: dict | None = None) 
         for line in comp["items"]:
             status = line.get("quote_status") or "Unknown"
             quote_status_counts[status] = quote_status_counts.get(status, 0) + 1
-        compact.append({"vendor": result["vendor"], "items": [
+        compact.append({"vendor": result["vendor"], "comparison_currency": comp.get("comparison_currency"),
+            "fx_rates_used": comp.get("fx_rates_used", {}), "items": [
             {k: line.get(k) for k in ("item_id", "item", "quantity", "unit", "quote_status", "quoted_quantity",
-              "quoted_unit", "unit_price", "currency", "price_basis", "normalized_price", "comparable_total",
-              "confidence", "evidence", "source_location", "notes")} for line in comp["items"]],
+              "quoted_unit", "unit_price", "currency", "price_basis", "normalized_price", "price_not_comparable_reason", "comparable_total",
+              "comparison_currency", "fx_rate", "fx_rate_date", "confidence", "evidence", "source_location", "notes")} for line in comp["items"]],
             "quote_status_counts": quote_status_counts,
             "questionnaire": result["terms"]["questionnaire"], "commercial_terms": result["terms"]["commercial_terms"],
             "missing_items": comp["missing_items"], "quantity_mismatches": comp["quantity_mismatches"],
             "unit_mismatches": comp["unit_mismatches"], "specification_mismatches": comp["specification_mismatches"],
             "currency_mismatches": comp["currency_mismatches"], "questionnaire_issues": comp["questionnaire_issues"],
             "term_issues": comp["term_issues"], "issues": comp["other_issues"], "source_notes": comp["vendor_notes"]})
-    prompt = f"""Answer only the buyer's question with concise, evidence-based analysis using the supplied comparison. Do not invent values or compare unlike currencies/units. For line-item counts, treat each vendor's quote_status_counts as authoritative: count only the exact status 'Quoted' as quoted, and report 'Needs review' and 'Not quoted in readable response' separately. A quantity mismatch does not change a line's quote_status. For missing-data claims, inspect the actual questionnaire and commercial_terms values: only empty or null values are missing, and any non-empty value is stated. Never describe questionnaire answers or commercial terms as unpopulated if any values are present. Mention assumptions or uncertainty only when relevant to the buyer's question; do not add generic caveats or unrelated categories. Return JSON: {{"answer":"markdown text","table":{{"title":"","columns":[],"rows":[]}} or null,"chart":{{"title":"","labels":[],"values":[]}} or null}}. Table/chart are optional; include only when useful and derive all values from the data.\nQuestion: {question}\nRFx: {json.dumps(rfx, ensure_ascii=False)}\nComparison: {json.dumps(compact, ensure_ascii=False)}"""
+    prompt = f"""Answer only the buyer's question with concise, evidence-based analysis using the supplied comparison. Do not invent values or compare unlike currencies/units. Each vendor's normalized_price and comparable_total are in that vendor comparison's comparison_currency; unit_price and currency preserve the supplier's original quote. Compare normalized values only when present. If they are absent, explain the stated price_not_comparable_reason. Rate and rate date are included when conversion was applied. For line-item counts, treat each vendor's quote_status_counts as authoritative: count only the exact status 'Quoted' as quoted, and report 'Needs review' and 'Not quoted in readable response' separately. A quantity mismatch does not change a line's quote_status. Never claim a vendor is the only one to quote all lines unless the counts show that every other vendor quoted fewer RFx lines. A 'best quote' is not automatically a defensible award: distinguish price, coverage, quantity/specification issues, questionnaire answers, and commercial terms; state the basis for any comparison, and do not imply a definitive award where no weighting criteria were supplied. For missing-data claims, inspect the actual questionnaire and commercial_terms values: only empty or null values are missing, and any non-empty value is stated. Never describe questionnaire answers or commercial terms as unpopulated if any values are present. Mention assumptions or uncertainty only when relevant to the buyer's question; do not add generic caveats or unrelated categories. Return JSON: {{"answer":"markdown text","table":{{"title":"","columns":[],"rows":[]}} or null,"chart":{{"title":"","labels":[],"values":[]}} or null}}. Table/chart are optional; include only when useful and derive all values from the data.\nQuestion: {question}\nRFx: {json.dumps(rfx, ensure_ascii=False)}\nComparison: {json.dumps(compact, ensure_ascii=False)}"""
     from google.genai import types
     client = _client()
     response = client.models.generate_content(model=MODEL, contents=prompt,

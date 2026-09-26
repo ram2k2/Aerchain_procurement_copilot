@@ -10,7 +10,7 @@ import pandas as pd
 import streamlit as st
 from docx import Document
 
-from main import analyst_answer, draft_rfx, empty_rfx, load_rfx, process_vendor_responses
+from main import analyst_answer, draft_rfx, empty_rfx, infer_rfx_currency, load_rfx, process_vendor_responses
 
 st.set_page_config(page_title="RFx Procurement Copilot", page_icon="📦", layout="wide")
 st.title("📦 RFx Procurement Copilot")
@@ -49,11 +49,14 @@ def _make_rfx_docx(rfx: dict) -> bytes:
 def _cell(line: dict) -> str:
     if line["quote_status"] != "Quoted":
         return line["quote_status"]
-    price = line.get("unit_price")
-    currency = line.get("currency") or "?"
-    unit = line.get("quoted_unit") or "unit unclear"
-    basis = line.get("price_basis") or f"per {unit}"
-    price_text = f"{currency} {price:g}" if isinstance(price, (int, float)) else "Price unclear"
+    converted = line.get("normalized_price")
+    comparison_currency = line.get("comparison_currency")
+    unit = line.get("unit") or line.get("quoted_unit") or "unit unclear"
+    if converted is None or not comparison_currency:
+        reason = line.get("price_not_comparable_reason")
+        return f"Price not comparable — {reason}" if reason else "Price not comparable"
+    formatted_price = f"{converted:,.4f}".rstrip("0").rstrip(".")
+    price_text = f"{comparison_currency} {formatted_price} per {unit}"
     qty = line.get("quoted_quantity")
     if isinstance(qty, (int, float)) and isinstance(line.get("quantity"), (int, float)):
         qty_text = f" · Qty {qty:g}/{line['quantity']:g} {line['unit']}"
@@ -61,11 +64,8 @@ def _cell(line: dict) -> str:
         qty_text = f" · Qty {qty:g} {line.get('quoted_unit') or ''} quoted"
     else:
         qty_text = ""
-    converted = line.get("normalized_price")
-    if currency != "INR" and converted is not None:
-        price_text += f" ≈ INR {converted:g} (buyer rate)"
     confidence = line.get("confidence", "")
-    return f"{price_text} ({basis}){qty_text}" + (f" · {confidence} confidence" if confidence else "")
+    return price_text + qty_text + (f" · {confidence} confidence" if confidence else "")
 
 
 def _side_by_side(results: list[dict], rfx: dict) -> pd.DataFrame:
@@ -152,7 +152,7 @@ with tab1:
         st.subheader("Generated RFx · Review and edit before sharing")
         rfx["scope"] = st.text_area("Scope", value=rfx.get("scope", ""), key="rfx_scope_edit")
         items_df = pd.DataFrame(rfx.get("items", []), columns=["item_id", "item", "specification", "quantity", "unit"] if not rfx.get("items") else None)
-        rfx["items"] = st.data_editor(items_df, num_rows="dynamic", use_container_width=True, hide_index=True, key="rfx_items_edit").fillna("").to_dict("records")
+        rfx["items"] = st.data_editor(items_df, num_rows="dynamic", width="stretch", hide_index=True, key="rfx_items_edit").fillna("").to_dict("records")
         left, right = st.columns(2)
         with left:
             questions = rfx.get("questionnaire", [])
@@ -164,7 +164,7 @@ with tab1:
             terms = pd.DataFrame([{"term": k.replace("_", " ").title(), "requirement": v}
                                   for k, v in (rfx.get("commercial_terms") or {}).items()],
                                  columns=["term", "requirement"])
-            edited_terms = st.data_editor(terms, num_rows="dynamic", use_container_width=True, hide_index=True,
+            edited_terms = st.data_editor(terms, num_rows="dynamic", width="stretch", hide_index=True,
                                           key="rfx_terms_edit", column_config={"term": "Term", "requirement": "Requirement"})
             rfx["commercial_terms"] = {str(row["term"]).strip().lower().replace(" ", "_"): row["requirement"]
                                        for row in edited_terms.fillna("").to_dict("records") if str(row["term"]).strip()}
@@ -175,6 +175,7 @@ with tab1:
 with tab2:
     st.header("Upload Vendor Responses")
     has_rfx_items = bool(st.session_state.rfx.get("items"))
+    rfx_currency = infer_rfx_currency(st.session_state.rfx) if has_rfx_items else ""
     if not has_rfx_items:
         with st.container(border=True):
             st.warning("RFx document required")
@@ -203,17 +204,27 @@ with tab2:
         file = st.file_uploader(f"Vendor {i}", type=["xlsx", "xls", "csv", "pdf", "docx", "jpg", "jpeg", "png", "webp", "txt", "eml"], key=f"vendor_{i}")
         if file is not None:
             uploaded.append(file)
-    st.caption("One Gemini request extracts all non-spreadsheet files in this batch. Spreadsheets are read locally; comparisons use no Gemini call. Currency conversion is not applied.")
+    comparison_currency_input = ""
+    if has_rfx_items and rfx_currency:
+        st.caption(f"Comparison currency from RFx: {rfx_currency}. Vendor prices in other currencies are converted using the latest available reference rate.")
+    elif has_rfx_items:
+        st.warning("The RFx does not state a comparison currency. Enter one to normalize vendor prices.")
+        comparison_currency_input = st.text_input("Comparison currency (three-letter code)", max_chars=3,
+                                                  key="comparison_currency_input").strip().upper()
+    st.caption("One Gemini request extracts all non-spreadsheet files in this batch. Spreadsheets are read locally; comparison and currency calculations use no Gemini call.")
     if not has_rfx_items and uploaded:
         st.info(f"{len(uploaded)} vendor response(s) staged. Upload the RFx to enable comparison.")
-    process_clicked = st.button("🔍 Process Vendor Responses", type="primary", disabled=not uploaded or not has_rfx_items)
+    has_comparison_currency = bool(rfx_currency or comparison_currency_input)
+    process_clicked = st.button("🔍 Process Vendor Responses", type="primary",
+                                disabled=not uploaded or not has_rfx_items or not has_comparison_currency)
     if process_clicked:
         st.session_state.vendor_results = []
         st.session_state.analyst_cache = {}
         st.session_state.analyst_history = []
         try:
             with st.spinner("Reading vendor responses and building the comparison…"):
-                results, call_count = process_vendor_responses(uploaded, st.session_state.rfx)
+                results, call_count = process_vendor_responses(uploaded, st.session_state.rfx,
+                                                               comparison_currency=comparison_currency_input or None)
             st.session_state.vendor_results = results
             st.session_state.processed_rfx = deepcopy(st.session_state.rfx)
             st.session_state.gemini_extract_calls = call_count
@@ -236,7 +247,17 @@ with tab3:
         if comparison_rfx != st.session_state.rfx:
             st.info("The RFx was edited after this comparison was processed. Reprocess vendors to compare against the latest draft.")
         frame = _side_by_side(results, comparison_rfx)
-        st.dataframe(frame, use_container_width=True, hide_index=True)
+        st.dataframe(frame, width="stretch", hide_index=True)
+        comparison = results[0]["comparison"]
+        if comparison.get("fx_rate_error"):
+            st.warning(comparison["fx_rate_error"] + " Prices without a rate are marked as not comparable.")
+        if comparison.get("fx_rates_used"):
+            rate_text = "; ".join(
+                f"1 {currency} = {info['rate']:.6g} {comparison['comparison_currency']}"
+                + (f" ({info['date']})" if info.get("date") else "")
+                for currency, info in sorted(comparison["fx_rates_used"].items())
+            )
+            st.caption(f"FX reference rates applied: {rate_text}. Original prices remain in each vendor's source document.")
         st.download_button("Download comparison (CSV)", frame.to_csv(index=False).encode("utf-8-sig"), "vendor-comparison.csv", "text/csv")
         source_columns = st.columns(len(results))
         for column, result in zip(source_columns, results):
@@ -249,18 +270,20 @@ with tab3:
         questionnaire_frame = _answer_matrix(results, comparison_rfx, "questionnaire", "Question")
         if not questionnaire_frame.empty:
             st.subheader("Questionnaire answers")
-            st.dataframe(questionnaire_frame, use_container_width=True, hide_index=True)
+            st.dataframe(questionnaire_frame, width="stretch", hide_index=True)
         terms_frame = _answer_matrix(results, comparison_rfx, "commercial_terms", "Term")
         if not terms_frame.empty:
             st.subheader("Commercial terms")
-            st.dataframe(terms_frame, use_container_width=True, hide_index=True)
+            st.dataframe(terms_frame, width="stretch", hide_index=True)
         for result in results:
             comp = result["comparison"]
             with st.expander(f"{result['vendor']} · flagged items and source evidence"):
+                if comp.get("vendor_notes"):
+                    st.warning(comp["vendor_notes"])
                 st.write("**Lines not quoted in a readable response**", comp["missing_items"])
                 st.write("**Quantity mismatches**", comp["quantity_mismatches"])
                 st.write("**Unit mismatches**", comp["unit_mismatches"])
-                st.write("**Currency mismatches**", comp["currency_mismatches"])
+                st.write("**Currency issues**", comp["currency_mismatches"])
                 st.write("**Other issues / evidence**", comp["other_issues"])
                 st.write("**Specification differences**", comp["specification_mismatches"])
                 st.write("**Questionnaire gaps**", comp["questionnaire_issues"])
@@ -271,7 +294,7 @@ with tab3:
                                  for line in comp["items"] if line.get("evidence") or line.get("notes")]
                 if evidence_rows:
                     st.write("**Extracted evidence by line**")
-                    st.dataframe(pd.DataFrame(evidence_rows), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(evidence_rows), width="stretch", hide_index=True)
 
 with tab4:
     st.header("💬 AI Analyst")
@@ -285,7 +308,7 @@ with tab4:
             st.markdown(f"**{table.get('title') or 'Supporting data'}**")
             try:
                 table_df = pd.DataFrame(table["rows"], columns=table.get("columns") or None)
-                st.dataframe(table_df, use_container_width=True, hide_index=True)
+                st.dataframe(table_df, width="stretch", hide_index=True)
                 st.download_button("Download answer table (CSV)", table_df.to_csv(index=False).encode("utf-8-sig"),
                                    "analyst-table.csv", "text/csv", key=f"analyst_table_{answer_id}")
             except (ValueError, TypeError) as exc:

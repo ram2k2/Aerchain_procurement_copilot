@@ -1,10 +1,12 @@
 import unittest
 import sys
+import io
+from unittest.mock import MagicMock, patch
 from types import ModuleType, SimpleNamespace
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import main
+import pandas as pd
 
 ROOT = Path(__file__).resolve().parent
 
@@ -27,6 +29,74 @@ class RfxTests(unittest.TestCase):
         self.assertEqual(len(self.rfx["items"]), 30)
         self.assertEqual(len(self.rfx["questionnaire"]), 7)
         self.assertIn("45 days", self.rfx["commercial_terms"]["payment_terms"])
+
+    def test_comparison_currency_is_taken_from_rfx_without_an_inr_default(self):
+        self.assertEqual(main.infer_rfx_currency(self.rfx), "INR")
+        self.assertEqual(main.infer_rfx_currency({"commercial_terms": {}}), "")
+        self.assertEqual(main.infer_rfx_currency({"commercial_terms": {"currency": "Prices quoted in EUR"}}), "EUR")
+        no_currency = dict(self.rfx, commercial_terms={})
+        with self.assertRaisesRegex(ValueError, "Set a comparison currency"):
+            main.process_vendor_responses([ROOT / "Vendor_1.xlsx"], no_currency)
+
+    def test_latest_fx_rates_are_fetched_together_and_inverted_for_conversion(self):
+        class Response:
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args):
+                return False
+            def read(self):
+                return (b'[{"date":"2026-09-25","base":"INR","quote":"USD","rate":0.012},'
+                        b'{"date":"2026-09-25","base":"INR","quote":"EUR","rate":0.011}]')
+
+        with patch("urllib.request.urlopen", return_value=Response()) as request:
+            rates, dates, error = main._fetch_fx_rates("INR", ["USD", "EUR", "INR"])
+        request.assert_called_once()
+        self.assertIn("base=INR", request.call_args.args[0].full_url)
+        self.assertIn("quotes=EUR%2CUSD", request.call_args.args[0].full_url)
+        self.assertAlmostEqual(rates["USD"], 1 / 0.012)
+        self.assertAlmostEqual(rates["EUR"], 1 / 0.011)
+        self.assertEqual(dates, {"USD": "2026-09-25", "EUR": "2026-09-25"})
+        self.assertIsNone(error)
+
+    def test_conversion_uses_selected_comparison_currency_and_keeps_original_quote(self):
+        vendor = {"source_status": "readable", "items": [{
+            "item": "3-Ply Small Box", "rfx_line_id": 1, "quantity": 5000, "unit": "pcs",
+            "unit_price": 100, "currency": "USD", "price_basis": "per piece", "confidence": "high",
+            "evidence": "USD 100 per piece",
+        }]}
+        comparison = main.compare_vendor_with_rfx(
+            vendor, self.rfx, {"USD": 0.92}, base_currency="EUR", fx_rate_dates={"USD": "2026-09-25"}
+        )
+        row = comparison["items"][0]
+        self.assertEqual(row["currency"], "USD")
+        self.assertEqual(row["unit_price"], 100)
+        self.assertAlmostEqual(row["normalized_price"], 92)
+        self.assertAlmostEqual(row["comparable_total"], 460000)
+        self.assertEqual(row["comparison_currency"], "EUR")
+        self.assertEqual(row["fx_rate_date"], "2026-09-25")
+
+    def test_unavailable_fx_rate_keeps_original_price_and_flags_it(self):
+        vendor = {"source_status": "readable", "items": [{
+            "item": "3-Ply Small Box", "rfx_line_id": 1, "quantity": 5000, "unit": "pcs",
+            "unit_price": 100, "currency": "USD", "price_basis": "per piece", "confidence": "high",
+        }]}
+        row = main.compare_vendor_with_rfx(vendor, self.rfx, {}, base_currency="EUR")["items"][0]
+        self.assertEqual(row["unit_price"], 100)
+        self.assertEqual(row["currency"], "USD")
+        self.assertIsNone(row["normalized_price"])
+        self.assertIsNone(row["comparable_total"])
+
+    def test_currency_conversion_does_not_claim_a_price_in_an_incompatible_unit(self):
+        vendor = {"source_status": "readable", "items": [{
+            "item": "3-Ply Small Box", "rfx_line_id": 1, "quantity": 5000, "unit": "kg",
+            "unit_price": 100, "currency": "USD", "price_basis": "per kg", "confidence": "high",
+        }]}
+        comparison = main.compare_vendor_with_rfx(vendor, self.rfx, {"USD": 83}, base_currency="INR")
+        row = comparison["items"][0]
+        self.assertEqual(row["currency"], "USD")
+        self.assertIsNone(row["normalized_price"])
+        self.assertIsNone(row["comparable_total"])
+        self.assertEqual(comparison["unit_mismatches"][0]["quoted"], "kg")
 
     def test_gemini_client_reads_streamlit_cloud_secret(self):
         modules = fake_genai_modules()
@@ -69,7 +139,7 @@ class RfxTests(unittest.TestCase):
     def test_comparison_accepts_text_quantity_in_edited_rfx(self):
         edited_rfx = {"scope": "Test", "items": [{"item_id": "1", "item": "Boxes",
                       "specification": "Small box", "quantity": "5000", "unit": "pcs"}],
-                      "questionnaire": [], "commercial_terms": {}}
+                      "questionnaire": [], "commercial_terms": {"currency": "INR"}}
         vendor = {"source_status": "readable", "items": [{
             "item": "Boxes", "rfx_line_id": 1, "quantity": 5000.0, "unit": "pcs",
             "unit_price": 2, "currency": "INR", "price_basis": "per pcs", "confidence": "high",
@@ -198,6 +268,28 @@ class RfxTests(unittest.TestCase):
         self.assertAlmostEqual(row["normalized_price"], 41.5)
         self.assertAlmostEqual(row["comparable_total"], 207500)
 
+    def test_unsupported_price_basis_is_not_normalized_and_has_reason(self):
+        vendor = {"source_status": "readable", "items": [{
+            "item": "3-Ply Small Box", "rfx_line_id": 1, "quantity": 5000, "unit": "pcs",
+            "unit_price": 120, "currency": "INR", "price_basis": "per dozen pieces",
+            "confidence": "high", "evidence": "INR 120 per dozen pieces",
+        }]}
+        row = main.compare_vendor_with_rfx(vendor, self.rfx)["items"][0]
+        self.assertIsNone(row["normalized_price"])
+        self.assertIn("per dozen", row["price_not_comparable_reason"])
+        self.assertIn("cannot be converted", row["price_not_comparable_reason"])
+
+    def test_unrecognized_spreadsheet_layout_is_review_not_vendor_omission(self):
+        buffer = io.BytesIO()
+        pd.DataFrame({"Product description": ["Small box"], "Amount": [15]}).to_excel(buffer, index=False)
+        parsed = main._spreadsheet("unfamiliar.xlsx", buffer.getvalue())
+        self.assertEqual(parsed["source_status"], "unrecognized_layout")
+        vendor = main._normalise(parsed, "unfamiliar.xlsx", self.rfx)
+        comparison = main.compare_vendor_with_rfx(vendor, self.rfx)
+        self.assertEqual(comparison["missing_items"], [])
+        self.assertEqual(comparison["items"][0]["quote_status"], "Needs review - quote table format not recognized")
+        self.assertIn("Quote table format not recognized", comparison["vendor_notes"])
+
     def test_duplicate_rfx_names_use_specification_to_match_correct_line(self):
         vendor = {"source_status": "readable", "items": [{
             "item": "Corrugated Sheet", "specification": "1000x600 mm, 3-Ply", "quantity": 4000,
@@ -257,9 +349,11 @@ class RfxTests(unittest.TestCase):
         def extract_all(documents, _rfx):
             return [outputs_by_name[doc["name"]] for doc in documents]
 
-        with patch("main._extract_batch", side_effect=extract_all) as extract:
+        with patch("main._extract_batch", side_effect=extract_all) as extract, \
+             patch("main._fetch_fx_rates", return_value=({"USD": 83.0}, {"USD": "2026-09-25"}, None)) as fetch_rates:
             results, calls = main.process_vendor_responses(paths, self.rfx)
         extract.assert_called_once()
+        fetch_rates.assert_called_once_with("INR", ["USD"])
         self.assertEqual(calls, 1)
         self.assertEqual([doc["name"] for doc in extract.call_args.args[0]], [
             "Vendor_2.pdf", "Vendor_3.docx", "Vendor_4.txt", "Vendor_5.png"
@@ -270,7 +364,8 @@ class RfxTests(unittest.TestCase):
         self.assertEqual(covered, set(range(1, 31)))
         delta = next(r for r in results if r["vendor"] == "Delta Cartons")
         self.assertTrue(delta["comparison"]["quantity_mismatches"])
-        self.assertTrue(delta["comparison"]["currency_mismatches"])
+        self.assertEqual(delta["comparison"]["currency_mismatches"], [])
+        self.assertAlmostEqual(delta["comparison"]["items"][2]["normalized_price"], 0.33 * 83)
         meridian = next(r for r in results if r["vendor"] == "Meridian Packaging")
         self.assertAlmostEqual(meridian["comparison"]["items"][15]["normalized_price"], 18)
 
@@ -317,6 +412,8 @@ class RfxTests(unittest.TestCase):
         self.assertIn('"quote_status_counts": {"Quoted": 23, "Not quoted in readable response": 5, "Needs review": 2}', prompt)
         self.assertIn("only empty or null values are missing", prompt)
         self.assertIn("do not add generic caveats or unrelated categories", prompt)
+        self.assertIn("Never claim a vendor is the only one to quote all lines", prompt)
+        self.assertIn("do not imply a definitive award where no weighting criteria were supplied", prompt)
 
 
 if __name__ == "__main__":
