@@ -254,17 +254,6 @@ with tab3:
         if not terms_frame.empty:
             st.subheader("Commercial terms")
             st.dataframe(terms_frame, use_container_width=True, hide_index=True)
-        coverage = pd.Series({r["vendor"]: sum(x["quote_status"] == "Quoted" for x in r["comparison"]["items"]) for r in results}, name="Quoted lines")
-        st.markdown("**Quoted lines by vendor**")
-        st.bar_chart(coverage)
-        totals = {}
-        for result in results:
-            values = [line["comparable_total"] for line in result["comparison"]["items"] if line.get("comparable_total") is not None]
-            if values:
-                totals[result["vendor"]] = sum(values)
-        if totals:
-            st.caption("Comparable totals include only lines with compatible units/currency and sufficient quoted quantity. Missing lines are not imputed.")
-            st.bar_chart(pd.Series(totals, name="Comparable quoted value (INR)"))
         for result in results:
             comp = result["comparison"]
             with st.expander(f"{result['vendor']} · flagged items and source evidence"):

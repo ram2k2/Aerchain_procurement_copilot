@@ -28,7 +28,7 @@ The app starts with an empty RFx. Enter the buyer's scope, line items, questionn
 ## Gemini request budget
 
 - RFx drafting: one request per explicit Generate click.
-- Vendor processing: zero requests for spreadsheet-only uploads; one request for the entire non-spreadsheet batch.
+- Vendor processing: zero requests for spreadsheet-only uploads; one request for the entire non-spreadsheet batch, with up to 65,536 output tokens. If Gemini omits a file or returns invalid/incomplete JSON, processing stops and no comparison is created; the app does not retry automatically.
 - Comparison: local Python logic; no Gemini request.
 - Analyst: one request for a new question and current comparison. Repeating the same question against unchanged data reuses the answer in the Streamlit session.
 

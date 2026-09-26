@@ -82,16 +82,19 @@ class RfxTests(unittest.TestCase):
     def test_supplier_extraction_prompt_uses_buyer_questions(self):
         client = SimpleNamespace(models=SimpleNamespace(generate_content=MagicMock(
             return_value=SimpleNamespace(text='{"vendors":[]}'))))
-        custom_rfx = {"scope": "Custom project", "items": [],
+        custom_rfx = {"scope": "Custom project", "items": [{"item_id": 1, "item": "Custom item"}],
                       "questionnaire": ["Can you meet our custom SLA?"], "commercial_terms": {}}
         with patch.dict(sys.modules, fake_genai_modules()), patch("main._client", return_value=client):
             main._extract_batch([], custom_rfx)
         prompt = client.models.generate_content.call_args.kwargs["contents"][0]
         self.assertIn("Can you meet our custom SLA?", prompt)
         self.assertIn("exactly 14 strings", prompt)
+        self.assertIn("an empty string if uncertain", prompt)
         self.assertNotIn("iso_9001", prompt)
         config = client.models.generate_content.call_args.kwargs["config"]
         self.assertEqual(config["response_mime_type"], "application/json")
+        self.assertEqual(config["max_output_tokens"], main.MAX_OUTPUT_TOKENS)
+        self.assertEqual(main.MAX_OUTPUT_TOKENS, 65536)
         self.assertEqual(config["response_schema"]["properties"]["vendors"]["type"], "array")
         self.assertNotIn("additionalProperties", str(config["response_schema"]))
         item_schema = config["response_schema"]["properties"]["vendors"]["items"]["properties"]["items"]
@@ -141,7 +144,7 @@ class RfxTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "finish reason: MAX_TOKENS") as error:
                 main._extract_batch([{"name": "Vendor.txt", "text": "sample quote"}], self.rfx)
         self.assertIn("Gemini JSON is incomplete", str(error.exception))
-        self.assertIn("Retrying will use one new Gemini request", str(error.exception))
+        self.assertIn("This request was not retried automatically", str(error.exception))
         client.models.generate_content.assert_called_once()
 
     def test_spreadsheet_parses_locally_and_aligns_all_rfx_rows(self):
@@ -249,10 +252,18 @@ class RfxTests(unittest.TestCase):
              "source_notes": "Remaining item prices refer to an unattached prior-year quote."},
         ]
         paths = [ROOT / name for name in ("Vendor_1.xlsx", "Vendor_2.pdf", "Vendor_3.docx", "Vendor_4.txt", "Vendor_5.png")]
-        with patch("main._extract_batch", return_value=outputs) as extract:
+        outputs_by_name = {output["file_name"]: output for output in outputs}
+
+        def extract_all(documents, _rfx):
+            return [outputs_by_name[doc["name"]] for doc in documents]
+
+        with patch("main._extract_batch", side_effect=extract_all) as extract:
             results, calls = main.process_vendor_responses(paths, self.rfx)
         extract.assert_called_once()
         self.assertEqual(calls, 1)
+        self.assertEqual([doc["name"] for doc in extract.call_args.args[0]], [
+            "Vendor_2.pdf", "Vendor_3.docx", "Vendor_4.txt", "Vendor_5.png"
+        ])
         self.assertEqual(len(results), 5)
         self.assertTrue(all(len(result["comparison"]["items"]) == 30 for result in results))
         covered = {line["item_id"] for result in results for line in result["comparison"]["items"] if line["quote_status"] == "Quoted"}
@@ -262,6 +273,21 @@ class RfxTests(unittest.TestCase):
         self.assertTrue(delta["comparison"]["currency_mismatches"])
         meridian = next(r for r in results if r["vendor"] == "Meridian Packaging")
         self.assertAlmostEqual(meridian["comparison"]["items"][15]["normalized_price"], 18)
+
+    def test_incomplete_batch_fails_closed_after_one_request(self):
+        sources = [ROOT / name for name in ("Vendor_2.pdf", "Vendor_3.docx", "Vendor_4.txt")]
+        incomplete_batch = [
+            {"file_name": "Vendor_2.pdf", "vendor": "Vendor 2", "source_status": "readable",
+             "items": [], "questionnaire": {}, "commercial_terms": {}},
+            {"file_name": "Vendor_3.docx", "vendor": "Vendor 3", "source_status": "readable",
+             "items": [], "questionnaire": {}, "commercial_terms": {}},
+        ]
+        with patch("main._extract_batch", return_value=incomplete_batch) as extract:
+            with self.assertRaisesRegex(ValueError, "after 1 Gemini request") as error:
+                main.process_vendor_responses(sources, self.rfx)
+        extract.assert_called_once()
+        self.assertIn("No comparison was created", str(error.exception))
+        self.assertIn("vendor_4.txt", str(error.exception))
 
     def test_rfx_draft_is_one_real_model_request_and_json_is_parsed(self):
         client = SimpleNamespace(models=SimpleNamespace(generate_content=MagicMock(
@@ -287,6 +313,10 @@ class RfxTests(unittest.TestCase):
         client.models.generate_content.assert_called_once()
         self.assertEqual(answer["table"]["rows"][0][1], 5)
         self.assertEqual(answer["chart"]["values"], [5])
+        prompt = client.models.generate_content.call_args.kwargs["contents"]
+        self.assertIn('"quote_status_counts": {"Quoted": 23, "Not quoted in readable response": 5, "Needs review": 2}', prompt)
+        self.assertIn("only empty or null values are missing", prompt)
+        self.assertIn("do not add generic caveats or unrelated categories", prompt)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_RFX_PATH = BASE_DIR / "RFx.docx"
 MODEL = "gemini-3.5-flash-lite"
 MAX_SOURCE_TEXT_CHARS = 50000
+MAX_OUTPUT_TOKENS = 65536
 VENDOR_RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -331,8 +332,8 @@ def _extract_batch(documents: list[dict], rfx: dict) -> list[dict]:
     terms_rule = ("Return commercial terms as an array of objects with the exact buyer term key in 'term' and supplier wording in 'response'. Include one entry per buyer term and use an empty response if unstated."
                   if reference["terms"] else
                   "Extract commercial terms as an array of objects with 'term' and 'response' strings; return an empty array if none are present.")
-    line_rule = ("Set rfx_line_id to the 1-based matching RFx line, or null if uncertain."
-                 if has_buyer_rfx else "Set rfx_line_id to null because no buyer RFx line list was provided.")
+    line_rule = ("Set rfx_line_id to the 1-based matching RFx line, or an empty string if uncertain."
+                 if has_buyer_rfx else "Set rfx_line_id to an empty string because no buyer RFx line list was provided.")
     prompt = f"""Read each labeled supplier response. Return JSON only with a top-level vendors array containing one object per source file. Each object must have file_name, vendor, source_status (readable/partially_readable/unreadable), source_notes, items (array of rows), questionnaire (array of question/answer objects), and commercial_terms (array of term/response objects). To keep the response compact, encode each item row as exactly 14 strings in this order: [rfx_line_id, item, specification, quantity, unit, unit_price, currency, price_basis, confidence, evidence, source_location, gst, delivery_days, notes]. Use an empty string for an unknown value; use a short exact evidence phrase. {line_rule} {questionnaire_rule} {terms_rule} Extract only supported facts; do not fill gaps by guessing. Preserve supplier wording in evidence. For parts you cannot read, state that explicitly and use low confidence/empty values rather than calling the information vendor-missing. Include file_name exactly as labeled.
 Buyer RFx, if supplied: {json.dumps(reference, ensure_ascii=False)}"""
     contents: list[Any] = [prompt]
@@ -351,7 +352,7 @@ Buyer RFx, if supplied: {json.dumps(reference, ensure_ascii=False)}"""
     response = client.models.generate_content(
         model=MODEL, contents=contents,
         config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=VENDOR_RESPONSE_SCHEMA,
-                                           max_output_tokens=10000),
+                                           max_output_tokens=MAX_OUTPUT_TOKENS),
     )
     try:
         parsed = _json(response.text)
@@ -360,7 +361,7 @@ Buyer RFx, if supplied: {json.dumps(reference, ensure_ascii=False)}"""
         status = _gemini_finish_status(response)
         raise ValueError(f"Gemini response could not be parsed as JSON ({type(exc).__name__}: {reason}; {status}). "
                          "No comparison was created. Your uploaded files are still available. "
-                         "Retrying will use one new Gemini request.") from exc
+                         "This request was not retried automatically.") from exc
     vendors = parsed.get("vendors", [])
     if not isinstance(vendors, list):
         raise ValueError("Gemini response is missing the vendors list.")
@@ -619,7 +620,7 @@ def compare_vendor_with_rfx(vendor: dict, rfx: dict | None = None, fx_rates: dic
 
 
 def process_vendor_responses(sources, rfx: dict | None = None, fx_rates: dict | None = None) -> tuple[list[dict], int]:
-    """Parse spreadsheets locally, batch all other uploads into one Gemini call, then compare locally."""
+    """Parse spreadsheets locally, extract all other uploads in one request, then compare locally."""
     if not isinstance(rfx, dict) or not rfx.get("items"):
         raise ValueError("Generate an RFx with at least one line item before processing vendor responses.")
     structured, unstructured = [], []
@@ -630,20 +631,39 @@ def process_vendor_responses(sources, rfx: dict | None = None, fx_rates: dict | 
             structured.append(_normalise(local, name, rfx))
         else:
             unstructured.append(_prepare_unstructured(name, data))
+    extraction_calls = 0
     if unstructured:
-        raw_vendors = _extract_batch(unstructured, rfx)
-        by_name = {Path(_text(v.get("file_name"))).name.lower(): v for v in raw_vendors}
-        for doc in unstructured:
-            raw = by_name.get(doc["name"].lower())
-            if raw is None:
-                raise ValueError(f"Gemini did not return extracted data for {doc['name']}.")
-            structured.append(_normalise(raw, doc["name"], rfx))
+        extraction_calls = 1
+        try:
+            raw_vendors = _extract_batch(unstructured, rfx)
+            if not isinstance(raw_vendors, list):
+                raise ValueError("Gemini response did not contain a vendor list.")
+            expected = [doc["name"].lower() for doc in unstructured]
+            returned = [Path(_text(v.get("file_name"))).name.lower()
+                        for v in raw_vendors if isinstance(v, dict)]
+            if len(raw_vendors) != len(unstructured) or sorted(returned) != sorted(expected):
+                missing = sorted(set(expected) - set(returned))
+                extra = sorted(set(returned) - set(expected))
+                detail = []
+                if missing:
+                    detail.append("missing: " + ", ".join(missing))
+                if extra:
+                    detail.append("unexpected: " + ", ".join(extra))
+                if not detail:
+                    detail.append("duplicate or malformed vendor entries")
+                raise ValueError("Gemini returned incomplete vendor extraction data (" + "; ".join(detail) + ").")
+            by_name = {Path(_text(v.get("file_name"))).name.lower(): v for v in raw_vendors}
+            structured.extend(_normalise(by_name[doc["name"].lower()], doc["name"], rfx)
+                              for doc in unstructured)
+        except Exception as exc:
+            raise ValueError(f"Vendor extraction failed after {extraction_calls} Gemini request(s) in this attempt. "
+                             f"No comparison was created. {exc}") from exc
     results = []
     for vendor in structured:
         results.append({"vendor": vendor["vendor"], "file_name": vendor["file_name"], "data": vendor,
                         "terms": {"questionnaire": vendor["questionnaire"], "commercial_terms": vendor["commercial_terms"]},
                         "comparison": compare_vendor_with_rfx(vendor, rfx, fx_rates), "status": "Processed"})
-    return results, 1 if unstructured else 0
+    return results, extraction_calls
 
 
 def process_vendor_response(source, rfx: dict | None = None, fx_rates: dict | None = None) -> dict:
@@ -687,16 +707,21 @@ def analyst_answer(question: str, results: list[dict], rfx: dict | None = None) 
     compact = []
     for result in results:
         comp = result["comparison"]
+        quote_status_counts = {}
+        for line in comp["items"]:
+            status = line.get("quote_status") or "Unknown"
+            quote_status_counts[status] = quote_status_counts.get(status, 0) + 1
         compact.append({"vendor": result["vendor"], "items": [
             {k: line.get(k) for k in ("item_id", "item", "quantity", "unit", "quote_status", "quoted_quantity",
               "quoted_unit", "unit_price", "currency", "price_basis", "normalized_price", "comparable_total",
               "confidence", "evidence", "source_location", "notes")} for line in comp["items"]],
+            "quote_status_counts": quote_status_counts,
             "questionnaire": result["terms"]["questionnaire"], "commercial_terms": result["terms"]["commercial_terms"],
             "missing_items": comp["missing_items"], "quantity_mismatches": comp["quantity_mismatches"],
             "unit_mismatches": comp["unit_mismatches"], "specification_mismatches": comp["specification_mismatches"],
             "currency_mismatches": comp["currency_mismatches"], "questionnaire_issues": comp["questionnaire_issues"],
             "term_issues": comp["term_issues"], "issues": comp["other_issues"], "source_notes": comp["vendor_notes"]})
-    prompt = f"""Answer the buyer with a concise, evidence-based procurement analysis. Use only the supplied comparison. Do not invent values, treat unknown questionnaire answers as pass, or compare unlike currencies/units. State assumptions, missing data, and uncertainty. Return JSON: {{"answer":"markdown text","table":{{"title":"","columns":[],"rows":[]}} or null,"chart":{{"title":"","labels":[],"values":[]}} or null}}. Table/chart are optional; include only when useful and derive all values from the data.\nQuestion: {question}\nRFx: {json.dumps(rfx, ensure_ascii=False)}\nComparison: {json.dumps(compact, ensure_ascii=False)}"""
+    prompt = f"""Answer only the buyer's question with concise, evidence-based analysis using the supplied comparison. Do not invent values or compare unlike currencies/units. For line-item counts, treat each vendor's quote_status_counts as authoritative: count only the exact status 'Quoted' as quoted, and report 'Needs review' and 'Not quoted in readable response' separately. A quantity mismatch does not change a line's quote_status. For missing-data claims, inspect the actual questionnaire and commercial_terms values: only empty or null values are missing, and any non-empty value is stated. Never describe questionnaire answers or commercial terms as unpopulated if any values are present. Mention assumptions or uncertainty only when relevant to the buyer's question; do not add generic caveats or unrelated categories. Return JSON: {{"answer":"markdown text","table":{{"title":"","columns":[],"rows":[]}} or null,"chart":{{"title":"","labels":[],"values":[]}} or null}}. Table/chart are optional; include only when useful and derive all values from the data.\nQuestion: {question}\nRFx: {json.dumps(rfx, ensure_ascii=False)}\nComparison: {json.dumps(compact, ensure_ascii=False)}"""
     from google.genai import types
     client = _client()
     response = client.models.generate_content(model=MODEL, contents=prompt,
